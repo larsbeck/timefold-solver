@@ -25,10 +25,12 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BrokenBarrierException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -64,6 +66,10 @@ import ai.timefold.solver.core.testdomain.list.unassignedvar.TestdataAllowsUnass
 import ai.timefold.solver.core.testdomain.list.unassignedvar.TestdataAllowsUnassignedValuesListEntity;
 import ai.timefold.solver.core.testdomain.list.unassignedvar.TestdataAllowsUnassignedValuesListSolution;
 import ai.timefold.solver.core.testdomain.list.unassignedvar.TestdataAllowsUnassignedValuesListValue;
+import ai.timefold.solver.core.testdomain.shadow.inverserelation.TestdataInverseRelationConstraintProvider;
+import ai.timefold.solver.core.testdomain.shadow.inverserelation.TestdataInverseRelationEntity;
+import ai.timefold.solver.core.testdomain.shadow.inverserelation.TestdataInverseRelationSolution;
+import ai.timefold.solver.core.testdomain.shadow.inverserelation.TestdataInverseRelationValue;
 import ai.timefold.solver.core.testutil.PlannerTestUtils;
 
 import org.apache.commons.lang3.mutable.MutableBoolean;
@@ -73,6 +79,8 @@ import org.assertj.core.api.Assertions;
 import org.jspecify.annotations.NonNull;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.mockito.Mockito;
 
 class SolverManagerTest {
@@ -399,6 +407,66 @@ class SolverManagerTest {
                 assertThat(initialSolutionEvent.isInitialized()).isFalse();
                 assertThat(initialSolutionEvent.producerId()).isEqualTo(EventProducerId.constructionHeuristic(0));
             }
+        }
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = EnvironmentMode.class, names = { "NO_ASSERT", "PHASE_ASSERT" })
+    @Timeout(60)
+    void firstInitializedSolutionDoesNotChangeWhileTheConsumerReadsIt(EnvironmentMode environmentMode)
+            throws ExecutionException, InterruptedException {
+        // The first initialized solution event carries the working solution, not a clone.
+        // After firing the event, AbstractPhase.phaseEnded asserts the score from scratch on that same solution
+        // in every asserted environment mode, which clears and refills every inverse relation shadow collection.
+        var solverConfig = new SolverConfig()
+                .withSolutionClass(TestdataInverseRelationSolution.class)
+                .withEntityClasses(TestdataInverseRelationEntity.class, TestdataInverseRelationValue.class)
+                .withConstraintProviderClass(TestdataInverseRelationConstraintProvider.class)
+                .withEnvironmentMode(environmentMode)
+                .withPhases(new ConstructionHeuristicPhaseConfig(),
+                        new LocalSearchPhaseConfig()
+                                .withTerminationConfig(new TerminationConfig().withSpentLimit(Duration.ofSeconds(1))));
+        var consumerRead = new CompletableFuture<Void>();
+        try (SolverManager<TestdataInverseRelationSolution> solverManager = SolverManager.create(solverConfig)) {
+            solverManager.solveBuilder()
+                    .withProblemId(1L)
+                    .withProblem(generateInverseRelationSolution(50, 2000))
+                    .withFirstInitializedSolutionEventConsumer(event -> readInverseRelationsSlowly(event.solution(),
+                            consumerRead))
+                    .run()
+                    .getFinalBestSolution();
+        }
+        assertThatCode(() -> consumerRead.get(30, TimeUnit.SECONDS))
+                .as("The first initialized solution changed while the consumer read it.")
+                .doesNotThrowAnyException();
+    }
+
+    private static TestdataInverseRelationSolution generateInverseRelationSolution(int valueCount, int entityCount) {
+        var solution = new TestdataInverseRelationSolution("solution");
+        solution.setValueList(IntStream.range(0, valueCount)
+                .mapToObj(i -> new TestdataInverseRelationValue("value" + i))
+                .toList());
+        solution.setEntityList(IntStream.range(0, entityCount)
+                .mapToObj(i -> new TestdataInverseRelationEntity("entity" + i))
+                .toList());
+        return solution;
+    }
+
+    private static void readInverseRelationsSlowly(TestdataInverseRelationSolution solution,
+            CompletableFuture<Void> consumerRead) {
+        var iterators = solution.getValueList().stream()
+                .map(value -> value.getEntities().iterator())
+                .toList();
+        try {
+            Thread.sleep(500);
+            for (var iterator : iterators) {
+                while (iterator.hasNext()) {
+                    iterator.next();
+                }
+            }
+            consumerRead.complete(null);
+        } catch (RuntimeException | InterruptedException e) {
+            consumerRead.completeExceptionally(e);
         }
     }
 
